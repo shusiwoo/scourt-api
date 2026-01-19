@@ -1,20 +1,19 @@
 """
 대법원 파산재산공고 스크래퍼 API
 Vercel Serverless Function
+- 카테고리 분류 (부동산/동산/채권/기타)
+- 첨부파일 핵심 정보 추출 (입찰기일, 최저가, 보증금)
 """
 
 from fastapi import FastAPI, Query, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import JSONResponse, HTMLResponse, FileResponse
-from fastapi.staticfiles import StaticFiles
+from fastapi.responses import HTMLResponse
 import requests
 from bs4 import BeautifulSoup
 from datetime import datetime
 from typing import List, Dict, Any, Optional
 import re
 import logging
-import os
-from pathlib import Path
 
 # 로깅 설정
 logging.basicConfig(level=logging.INFO)
@@ -24,7 +23,7 @@ logger = logging.getLogger(__name__)
 app = FastAPI(
     title="대법원 파산재산공고 API",
     description="대법원 파산재산공고 데이터를 실시간으로 수집하는 API",
-    version="1.0.0",
+    version="2.0.0",
     docs_url="/docs",
     redoc_url="/redoc"
 )
@@ -37,6 +36,180 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+
+def classify_category(title: str, content: str = "") -> str:
+    """공고 카테고리 분류"""
+    text = (title + " " + content).lower()
+    
+    # 부동산 키워드
+    real_estate_keywords = ['부동산', '토지', '건물', '아파트', '주택', '오피스텔', '상가', '공장', '창고', '대지', '임야', '전', '답', '빌딩', '근린시설']
+    # 동산 키워드
+    movable_keywords = ['동산', '차량', '자동차', '기계', '설비', '장비', '재고', '물품', '가구', '집기', '비품', '중장비', '트럭']
+    # 채권 키워드
+    bond_keywords = ['채권', '매출채권', '대여금', '보증금반환', '임대차보증금', '공사대금', '물품대금', '용역대금', '예금', '적금', '보험금', '주식', '출자지분']
+    # 무형자산 키워드
+    intangible_keywords = ['무형자산', '특허', '상표', '영업권', '저작권', '지식재산', '라이선스']
+    
+    for kw in real_estate_keywords:
+        if kw in text:
+            return '부동산'
+    
+    for kw in movable_keywords:
+        if kw in text:
+            return '동산'
+    
+    for kw in bond_keywords:
+        if kw in text:
+            return '채권'
+    
+    for kw in intangible_keywords:
+        if kw in text:
+            return '기타'
+    
+    return '기타'
+
+
+def extract_bid_info(content: str) -> Dict[str, Any]:
+    """공고 내용에서 입찰 정보 추출"""
+    info = {
+        'bid_date': None,           # 입찰기일
+        'bid_location': None,       # 입찰장소
+        'minimum_price': None,      # 최저가/매각가
+        'deposit': None,            # 보증금
+        'deposit_rate': None,       # 보증금 비율
+        'payment_deadline': None,   # 잔금납부기한
+        'property_location': None,  # 소재지
+        'area': None,               # 면적
+    }
+    
+    if not content:
+        return info
+    
+    # 입찰기일 추출 (다양한 패턴)
+    date_patterns = [
+        r'입찰기일[:\s]*(\d{4}[.\-/년]\s*\d{1,2}[.\-/월]\s*\d{1,2}일?)',
+        r'입찰일[:\s]*(\d{4}[.\-/년]\s*\d{1,2}[.\-/월]\s*\d{1,2}일?)',
+        r'매각기일[:\s]*(\d{4}[.\-/년]\s*\d{1,2}[.\-/월]\s*\d{1,2}일?)',
+        r'(\d{4}[.\-/년]\s*\d{1,2}[.\-/월]\s*\d{1,2}일?)[^\d]*입찰',
+        r'기일[:\s]*(\d{4}[.\-/년]\s*\d{1,2}[.\-/월]\s*\d{1,2}일?)',
+    ]
+    
+    for pattern in date_patterns:
+        match = re.search(pattern, content)
+        if match:
+            info['bid_date'] = match.group(1).strip()
+            break
+    
+    # 입찰장소 추출
+    location_patterns = [
+        r'입찰장소[:\s]*([^\n,]+)',
+        r'장소[:\s]*([^\n,]+법원[^\n,]*)',
+    ]
+    
+    for pattern in location_patterns:
+        match = re.search(pattern, content)
+        if match:
+            info['bid_location'] = match.group(1).strip()[:100]
+            break
+    
+    # 금액 추출 (최저가, 매각가)
+    price_patterns = [
+        r'최저(?:입찰)?가(?:격)?[:\s]*([0-9,]+)\s*원',
+        r'매각(?:예정)?가(?:격)?[:\s]*([0-9,]+)\s*원',
+        r'감정가(?:격)?[:\s]*([0-9,]+)\s*원',
+        r'(?:금|₩)\s*([0-9,]+)\s*원',
+        r'([0-9]{1,3}(?:,[0-9]{3})+)\s*원',
+    ]
+    
+    for pattern in price_patterns:
+        match = re.search(pattern, content)
+        if match:
+            price_str = match.group(1).replace(',', '')
+            try:
+                info['minimum_price'] = int(price_str)
+            except:
+                pass
+            break
+    
+    # 보증금 추출
+    deposit_patterns = [
+        r'보증금[:\s]*([0-9,]+)\s*원',
+        r'입찰보증금[:\s]*([0-9,]+)\s*원',
+        r'보증금[:\s]*최저(?:입찰)?가(?:격)?의?\s*(\d+)[%％]',
+        r'보증금[:\s]*(\d+)[%％]',
+    ]
+    
+    for pattern in deposit_patterns:
+        match = re.search(pattern, content)
+        if match:
+            value = match.group(1).replace(',', '')
+            if '%' in pattern or '％' in pattern:
+                info['deposit_rate'] = f"{value}%"
+            else:
+                try:
+                    info['deposit'] = int(value)
+                except:
+                    pass
+            break
+    
+    # 소재지 추출
+    location_addr_patterns = [
+        r'소재지[:\s]*([^\n]+)',
+        r'소재[:\s]*([^\n]+)',
+        r'주소[:\s]*([^\n]+)',
+        r'물건(?:의)?\s*표시[:\s]*([^\n]+)',
+    ]
+    
+    for pattern in location_addr_patterns:
+        match = re.search(pattern, content)
+        if match:
+            info['property_location'] = match.group(1).strip()[:200]
+            break
+    
+    # 면적 추출
+    area_patterns = [
+        r'면적[:\s]*([0-9,.]+)\s*(?:㎡|m2|제곱미터|평)',
+        r'([0-9,.]+)\s*(?:㎡|m2)',
+        r'([0-9,.]+)\s*평',
+    ]
+    
+    for pattern in area_patterns:
+        match = re.search(pattern, content)
+        if match:
+            info['area'] = match.group(1).strip()
+            break
+    
+    # 잔금납부기한 추출
+    payment_patterns = [
+        r'잔금[^\n]*기한[:\s]*(\d{4}[.\-/년]\s*\d{1,2}[.\-/월]\s*\d{1,2}일?)',
+        r'대금[^\n]*납부[^\n]*기한[:\s]*(\d{4}[.\-/년]\s*\d{1,2}[.\-/월]\s*\d{1,2}일?)',
+    ]
+    
+    for pattern in payment_patterns:
+        match = re.search(pattern, content)
+        if match:
+            info['payment_deadline'] = match.group(1).strip()
+            break
+    
+    return info
+
+
+def format_price(price: int) -> str:
+    """금액 포맷팅 (억/만원 단위)"""
+    if price is None:
+        return None
+    
+    if price >= 100000000:  # 1억 이상
+        eok = price // 100000000
+        man = (price % 100000000) // 10000
+        if man > 0:
+            return f"{eok}억 {man:,}만원"
+        return f"{eok}억원"
+    elif price >= 10000:  # 1만원 이상
+        return f"{price // 10000:,}만원"
+    else:
+        return f"{price:,}원"
 
 
 class SCourtScraper:
@@ -102,6 +275,9 @@ class SCourtScraper:
                     
                     views = cols[4].get_text(strip=True) if len(cols) > 4 else '0'
                     
+                    # 카테고리 분류
+                    category = classify_category(title)
+                    
                     notice = {
                         'num': num,
                         'court': court,
@@ -109,6 +285,7 @@ class SCourtScraper:
                         'title': title,
                         'detail_id': detail_id,
                         'views': views,
+                        'category': category,
                         'detail_url': f"{self.base_url}{href}" if href else None
                     }
                     
@@ -125,7 +302,7 @@ class SCourtScraper:
             return []
     
     def get_notice_detail(self, detail_id: str) -> Optional[Dict[str, Any]]:
-        """공고 상세 정보 가져오기"""
+        """공고 상세 정보 가져오기 (입찰정보 추출 포함)"""
         try:
             detail_url = f"{self.base_url}/portal/notice/realestate/RealNoticeView.work"
             params = {'seq_id': detail_id}
@@ -142,9 +319,15 @@ class SCourtScraper:
             title_elem = soup.find('h3', {'class': 'tit'}) or soup.find('h2')
             title = title_elem.get_text(strip=True) if title_elem else 'Unknown'
             
-            # 내용
+            # 내용 (전체)
             content_elem = soup.find('div', {'class': 'view_cont'}) or soup.find('div', {'class': 'content'})
-            content = content_elem.get_text(strip=True) if content_elem else ''
+            full_content = content_elem.get_text(strip=True) if content_elem else ''
+            
+            # 카테고리 분류
+            category = classify_category(title, full_content)
+            
+            # 입찰 정보 추출
+            bid_info = extract_bid_info(full_content)
             
             # 첨부파일
             attachments = []
@@ -162,13 +345,27 @@ class SCourtScraper:
                         
                         attachments.append({
                             'filename': original_filename,
-                            'stored_name': stored_filename
+                            'stored_name': stored_filename,
+                            'type': 'pdf' if original_filename.lower().endswith('.pdf') else 'other'
                         })
             
             return {
                 'id': detail_id,
                 'title': title,
-                'content': content[:1000],
+                'category': category,
+                'content': full_content[:2000],
+                'bid_info': {
+                    'bid_date': bid_info['bid_date'],
+                    'bid_location': bid_info['bid_location'],
+                    'minimum_price': bid_info['minimum_price'],
+                    'minimum_price_formatted': format_price(bid_info['minimum_price']),
+                    'deposit': bid_info['deposit'],
+                    'deposit_formatted': format_price(bid_info['deposit']),
+                    'deposit_rate': bid_info['deposit_rate'],
+                    'payment_deadline': bid_info['payment_deadline'],
+                    'property_location': bid_info['property_location'],
+                    'area': bid_info['area'],
+                },
                 'attachments': attachments,
                 'attachment_count': len(attachments),
                 'scraped_at': datetime.now().isoformat()
@@ -183,9 +380,8 @@ class SCourtScraper:
 scraper = SCourtScraper()
 
 
-# HTML 랜딩페이지
-LANDING_HTML = """
-<!DOCTYPE html>
+# HTML 랜딩페이지 (카테고리 탭 + 상세 입찰정보)
+LANDING_HTML = '''<!DOCTYPE html>
 <html lang="ko">
 <head>
     <meta charset="UTF-8">
@@ -198,127 +394,138 @@ LANDING_HTML = """
         * { font-family: 'Noto Sans KR', sans-serif; }
         .gradient-bg { background: linear-gradient(135deg, #1e3a5f 0%, #2d5a87 50%, #3d7ab5 100%); }
         .card-hover { transition: all 0.3s ease; }
-        .card-hover:hover { transform: translateY(-5px); box-shadow: 0 20px 40px rgba(0,0,0,0.15); }
-        .loading { display: inline-block; width: 20px; height: 20px; border: 3px solid #f3f3f3; border-top: 3px solid #3498db; border-radius: 50%; animation: spin 1s linear infinite; }
-        @keyframes spin { 0% { transform: rotate(0deg); } 100% { transform: rotate(360deg); } }
-        .fade-in { animation: fadeIn 0.5s ease-in; }
-        @keyframes fadeIn { from { opacity: 0; transform: translateY(20px); } to { opacity: 1; transform: translateY(0); } }
-        .badge { font-size: 0.75rem; padding: 0.25rem 0.75rem; border-radius: 9999px; }
-        .attachment-card { border-left: 4px solid #3b82f6; }
-        .modal { display: none; position: fixed; top: 0; left: 0; width: 100%; height: 100%; background: rgba(0,0,0,0.5); z-index: 1000; justify-content: center; align-items: center; }
+        .card-hover:hover { transform: translateY(-4px); box-shadow: 0 12px 24px rgba(0,0,0,0.15); }
+        .loading { display: inline-block; width: 24px; height: 24px; border: 3px solid #e5e7eb; border-top-color: #3b82f6; border-radius: 50%; animation: spin 0.8s linear infinite; }
+        @keyframes spin { to { transform: rotate(360deg); } }
+        .fade-in { animation: fadeIn 0.4s ease-out; }
+        @keyframes fadeIn { from { opacity: 0; transform: translateY(10px); } to { opacity: 1; transform: translateY(0); } }
+        .badge { font-size: 0.7rem; padding: 0.2rem 0.6rem; border-radius: 9999px; font-weight: 500; }
+        .category-tab { transition: all 0.2s; border-bottom: 3px solid transparent; }
+        .category-tab.active { border-bottom-color: #3b82f6; color: #3b82f6; font-weight: 600; }
+        .category-tab:hover { color: #3b82f6; }
+        .info-grid { display: grid; grid-template-columns: repeat(2, 1fr); gap: 0.75rem; }
+        @media (min-width: 768px) { .info-grid { grid-template-columns: repeat(3, 1fr); } }
+        .info-item { background: #f8fafc; padding: 0.75rem; border-radius: 0.5rem; }
+        .info-label { font-size: 0.75rem; color: #64748b; margin-bottom: 0.25rem; }
+        .info-value { font-size: 0.95rem; font-weight: 600; color: #1e293b; }
+        .modal { display: none; position: fixed; inset: 0; background: rgba(0,0,0,0.5); z-index: 50; justify-content: center; align-items: center; padding: 1rem; }
         .modal.active { display: flex; }
-        .modal-content { background: white; border-radius: 1rem; max-width: 800px; max-height: 90vh; overflow-y: auto; width: 90%; }
+        .modal-content { background: white; border-radius: 1rem; max-width: 900px; width: 100%; max-height: 90vh; overflow-y: auto; }
+        .price-highlight { background: linear-gradient(135deg, #fef3c7, #fde68a); padding: 1rem; border-radius: 0.75rem; border-left: 4px solid #f59e0b; }
+        .category-badge-부동산 { background: #dbeafe; color: #1d4ed8; }
+        .category-badge-동산 { background: #dcfce7; color: #15803d; }
+        .category-badge-채권 { background: #fce7f3; color: #be185d; }
+        .category-badge-기타 { background: #f3e8ff; color: #7c3aed; }
     </style>
 </head>
 <body class="bg-gray-50 min-h-screen">
     <!-- Header -->
     <header class="gradient-bg text-white">
-        <div class="container mx-auto px-4 py-8">
-            <div class="flex items-center justify-between">
-                <div>
-                    <div class="flex items-center gap-3 mb-2">
-                        <i class="fas fa-landmark text-3xl"></i>
-                        <h1 class="text-2xl md:text-3xl font-bold">대법원 파산재산공고</h1>
+        <div class="container mx-auto px-4 py-6">
+            <div class="flex items-center justify-between mb-4">
+                <div class="flex items-center gap-3">
+                    <i class="fas fa-landmark text-2xl"></i>
+                    <div>
+                        <h1 class="text-xl md:text-2xl font-bold">대법원 파산재산공고</h1>
+                        <p class="text-blue-200 text-xs md:text-sm">실시간 매각공고 조회 서비스</p>
                     </div>
-                    <p class="text-blue-200 text-sm md:text-base">실시간 파산재산 매각공고 조회 서비스</p>
                 </div>
-                <div class="hidden md:flex items-center gap-4">
-                    <a href="/docs" target="_blank" class="bg-white/20 hover:bg-white/30 px-4 py-2 rounded-lg transition">
-                        <i class="fas fa-book mr-2"></i>API 문서
-                    </a>
-                </div>
+                <a href="/docs" target="_blank" class="hidden md:flex items-center gap-2 bg-white/20 hover:bg-white/30 px-3 py-2 rounded-lg text-sm transition">
+                    <i class="fas fa-book"></i>API
+                </a>
             </div>
             <!-- 검색 -->
-            <div class="mt-6">
-                <div class="flex flex-col md:flex-row gap-3">
-                    <div class="flex-1 relative">
-                        <input type="text" id="searchInput" placeholder="검색어를 입력하세요 (예: 부동산, 서울, 아파트...)" 
-                               class="w-full px-4 py-3 pl-12 rounded-lg text-gray-800 focus:outline-none focus:ring-2 focus:ring-blue-400">
-                        <i class="fas fa-search absolute left-4 top-1/2 transform -translate-y-1/2 text-gray-400"></i>
-                    </div>
-                    <button onclick="searchNotices()" class="bg-blue-600 hover:bg-blue-700 px-6 py-3 rounded-lg font-medium transition">
-                        <i class="fas fa-search mr-2"></i>검색
-                    </button>
-                    <button onclick="loadNotices()" class="bg-white/20 hover:bg-white/30 px-6 py-3 rounded-lg font-medium transition">
-                        <i class="fas fa-sync-alt mr-2"></i>새로고침
-                    </button>
+            <div class="flex gap-2">
+                <div class="flex-1 relative">
+                    <input type="text" id="searchInput" placeholder="검색어 입력 (예: 서울, 아파트, 차량...)" 
+                           class="w-full px-4 py-2.5 pl-10 rounded-lg text-gray-800 text-sm focus:outline-none focus:ring-2 focus:ring-blue-400">
+                    <i class="fas fa-search absolute left-3.5 top-1/2 -translate-y-1/2 text-gray-400 text-sm"></i>
                 </div>
+                <button onclick="searchNotices()" class="bg-blue-600 hover:bg-blue-700 px-4 py-2.5 rounded-lg text-sm font-medium transition">
+                    검색
+                </button>
             </div>
         </div>
     </header>
 
-    <!-- Stats Section -->
-    <section class="container mx-auto px-4 -mt-6 relative z-10">
-        <div class="grid grid-cols-2 md:grid-cols-4 gap-4" id="statsContainer">
-            <div class="bg-white rounded-xl shadow-lg p-4 card-hover">
-                <div class="flex items-center gap-3">
-                    <div class="bg-blue-100 p-3 rounded-lg"><i class="fas fa-file-alt text-blue-600 text-xl"></i></div>
-                    <div><p class="text-gray-500 text-sm">총 공고</p><p class="text-2xl font-bold text-gray-800" id="totalCount">-</p></div>
-                </div>
+    <!-- Category Tabs -->
+    <div class="bg-white border-b sticky top-0 z-40">
+        <div class="container mx-auto px-4">
+            <div class="flex gap-1 overflow-x-auto" id="categoryTabs">
+                <button onclick="filterByCategory('all')" class="category-tab active px-4 py-3 text-sm whitespace-nowrap" data-category="all">
+                    <i class="fas fa-th-large mr-1.5"></i>전체 <span class="count text-gray-400 ml-1">0</span>
+                </button>
+                <button onclick="filterByCategory('부동산')" class="category-tab px-4 py-3 text-sm whitespace-nowrap" data-category="부동산">
+                    <i class="fas fa-building mr-1.5"></i>부동산 <span class="count text-gray-400 ml-1">0</span>
+                </button>
+                <button onclick="filterByCategory('동산')" class="category-tab px-4 py-3 text-sm whitespace-nowrap" data-category="동산">
+                    <i class="fas fa-car mr-1.5"></i>동산 <span class="count text-gray-400 ml-1">0</span>
+                </button>
+                <button onclick="filterByCategory('채권')" class="category-tab px-4 py-3 text-sm whitespace-nowrap" data-category="채권">
+                    <i class="fas fa-file-invoice-dollar mr-1.5"></i>채권 <span class="count text-gray-400 ml-1">0</span>
+                </button>
+                <button onclick="filterByCategory('기타')" class="category-tab px-4 py-3 text-sm whitespace-nowrap" data-category="기타">
+                    <i class="fas fa-ellipsis-h mr-1.5"></i>기타 <span class="count text-gray-400 ml-1">0</span>
+                </button>
             </div>
-            <div class="bg-white rounded-xl shadow-lg p-4 card-hover">
-                <div class="flex items-center gap-3">
-                    <div class="bg-green-100 p-3 rounded-lg"><i class="fas fa-building text-green-600 text-xl"></i></div>
-                    <div><p class="text-gray-500 text-sm">부동산</p><p class="text-2xl font-bold text-gray-800" id="realEstateCount">-</p></div>
-                </div>
+        </div>
+    </div>
+
+    <!-- Stats -->
+    <section class="container mx-auto px-4 py-4">
+        <div class="grid grid-cols-4 gap-2 md:gap-4">
+            <div class="bg-white rounded-lg shadow p-3 text-center">
+                <p class="text-lg md:text-2xl font-bold text-blue-600" id="totalCount">-</p>
+                <p class="text-xs text-gray-500">전체</p>
             </div>
-            <div class="bg-white rounded-xl shadow-lg p-4 card-hover">
-                <div class="flex items-center gap-3">
-                    <div class="bg-purple-100 p-3 rounded-lg"><i class="fas fa-gavel text-purple-600 text-xl"></i></div>
-                    <div><p class="text-gray-500 text-sm">법원 수</p><p class="text-2xl font-bold text-gray-800" id="courtCount">-</p></div>
-                </div>
+            <div class="bg-white rounded-lg shadow p-3 text-center">
+                <p class="text-lg md:text-2xl font-bold text-green-600" id="realEstateCount">-</p>
+                <p class="text-xs text-gray-500">부동산</p>
             </div>
-            <div class="bg-white rounded-xl shadow-lg p-4 card-hover">
-                <div class="flex items-center gap-3">
-                    <div class="bg-orange-100 p-3 rounded-lg"><i class="fas fa-paperclip text-orange-600 text-xl"></i></div>
-                    <div><p class="text-gray-500 text-sm">첨부파일</p><p class="text-2xl font-bold text-gray-800" id="attachmentCount">-</p></div>
-                </div>
+            <div class="bg-white rounded-lg shadow p-3 text-center">
+                <p class="text-lg md:text-2xl font-bold text-purple-600" id="movableCount">-</p>
+                <p class="text-xs text-gray-500">동산</p>
+            </div>
+            <div class="bg-white rounded-lg shadow p-3 text-center">
+                <p class="text-lg md:text-2xl font-bold text-pink-600" id="bondCount">-</p>
+                <p class="text-xs text-gray-500">채권</p>
             </div>
         </div>
     </section>
 
+    <!-- Court Filter -->
+    <section class="container mx-auto px-4 pb-2">
+        <div class="flex flex-wrap gap-1.5" id="courtFilters"></div>
+    </section>
+
     <!-- Main Content -->
-    <main class="container mx-auto px-4 py-8">
-        <!-- Court Filter -->
-        <div class="mb-6">
-            <div class="flex flex-wrap gap-2" id="courtFilters">
-                <button onclick="filterByCourt('all')" class="court-filter active bg-blue-600 text-white px-4 py-2 rounded-full text-sm font-medium transition" data-court="all">전체</button>
-            </div>
+    <main class="container mx-auto px-4 pb-8">
+        <div class="space-y-3" id="noticesContainer">
+            <div class="text-center py-12"><div class="loading"></div><p class="text-gray-500 mt-3 text-sm">공고 목록을 불러오는 중...</p></div>
         </div>
-        <!-- Notices List -->
-        <div class="space-y-4" id="noticesContainer">
-            <div class="text-center py-12"><div class="loading"></div><p class="text-gray-500 mt-4">공고 목록을 불러오는 중...</p></div>
-        </div>
-        <!-- Load More -->
-        <div class="text-center mt-8" id="loadMoreContainer" style="display: none;">
-            <button onclick="loadMore()" class="bg-gray-200 hover:bg-gray-300 text-gray-700 px-8 py-3 rounded-lg font-medium transition"><i class="fas fa-plus mr-2"></i>더 보기</button>
+        <div class="text-center mt-6" id="loadMoreContainer" style="display:none;">
+            <button onclick="loadMore()" class="bg-gray-100 hover:bg-gray-200 text-gray-700 px-6 py-2.5 rounded-lg text-sm font-medium transition">
+                <i class="fas fa-plus mr-2"></i>더 보기
+            </button>
         </div>
     </main>
 
     <!-- Detail Modal -->
     <div class="modal" id="detailModal">
-        <div class="modal-content p-6">
-            <div class="flex justify-between items-start mb-4">
-                <h2 class="text-xl font-bold text-gray-800" id="modalTitle">공고 상세</h2>
-                <button onclick="closeModal()" class="text-gray-400 hover:text-gray-600"><i class="fas fa-times text-xl"></i></button>
+        <div class="modal-content">
+            <div class="sticky top-0 bg-white border-b px-5 py-4 flex justify-between items-center">
+                <h2 class="text-lg font-bold text-gray-800 truncate pr-4" id="modalTitle">공고 상세</h2>
+                <button onclick="closeModal()" class="text-gray-400 hover:text-gray-600 p-1"><i class="fas fa-times text-xl"></i></button>
             </div>
-            <div id="modalContent"><div class="text-center py-8"><div class="loading"></div></div></div>
+            <div class="p-5" id="modalContent"><div class="text-center py-8"><div class="loading"></div></div></div>
         </div>
     </div>
 
     <!-- Footer -->
-    <footer class="bg-gray-800 text-white py-8 mt-12">
-        <div class="container mx-auto px-4">
-            <div class="flex flex-col md:flex-row justify-between items-center">
-                <div class="mb-4 md:mb-0">
-                    <p class="text-gray-400 text-sm"><i class="fas fa-info-circle mr-2"></i>본 서비스는 대법원 파산재산공고 정보를 자동 수집하여 제공합니다.</p>
-                    <p class="text-gray-500 text-xs mt-1">데이터 출처: <a href="https://www.scourt.go.kr" target="_blank" class="text-blue-400 hover:underline">대법원 전자공고</a></p>
-                </div>
-                <div class="flex gap-4">
-                    <a href="/docs" target="_blank" class="text-gray-400 hover:text-white transition"><i class="fas fa-book"></i> API 문서</a>
-                    <a href="/api/stats" target="_blank" class="text-gray-400 hover:text-white transition"><i class="fas fa-chart-bar"></i> 통계</a>
-                </div>
-            </div>
+    <footer class="bg-gray-800 text-gray-400 py-6">
+        <div class="container mx-auto px-4 text-center text-xs">
+            <p>데이터 출처: <a href="https://www.scourt.go.kr" target="_blank" class="text-blue-400 hover:underline">대법원 전자공고</a></p>
+            <p class="mt-1">본 서비스는 공공 정보를 자동 수집하여 제공합니다.</p>
         </div>
     </footer>
 
@@ -326,22 +533,22 @@ LANDING_HTML = """
         const API_BASE = '';
         let currentPage = 1;
         let allNotices = [];
-        let currentFilter = 'all';
+        let currentCategory = 'all';
+        let currentCourt = 'all';
 
         async function loadNotices() {
             try {
-                document.getElementById('noticesContainer').innerHTML = '<div class="text-center py-12"><div class="loading"></div><p class="text-gray-500 mt-4">공고 목록을 불러오는 중...</p></div>';
-                const response = await fetch(`${API_BASE}/api/notices?page=1&limit=20`);
+                showLoading();
+                const response = await fetch(`${API_BASE}/api/notices?page=1&limit=30`);
                 const data = await response.json();
                 if (data.success) {
                     allNotices = data.notices;
-                    updateStats(data);
-                    updateCourtFilters(data.court_stats);
-                    renderNotices(allNotices);
+                    updateStats();
+                    updateCourtFilters();
+                    applyFilters();
                 }
             } catch (error) {
-                console.error('Error:', error);
-                document.getElementById('noticesContainer').innerHTML = '<div class="text-center py-12"><i class="fas fa-exclamation-circle text-red-500 text-4xl mb-4"></i><p class="text-gray-500">데이터를 불러오는데 실패했습니다.</p><button onclick="loadNotices()" class="mt-4 text-blue-600 hover:underline">다시 시도</button></div>';
+                showError();
             }
         }
 
@@ -349,92 +556,198 @@ LANDING_HTML = """
             const keyword = document.getElementById('searchInput').value.trim();
             if (!keyword) { loadNotices(); return; }
             try {
-                document.getElementById('noticesContainer').innerHTML = `<div class="text-center py-12"><div class="loading"></div><p class="text-gray-500 mt-4">'${keyword}' 검색 중...</p></div>`;
+                showLoading(`'${keyword}' 검색 중...`);
                 const response = await fetch(`${API_BASE}/api/search?keyword=${encodeURIComponent(keyword)}&pages=5`);
                 const data = await response.json();
                 if (data.success) {
                     allNotices = data.notices;
-                    document.getElementById('totalCount').textContent = data.match_count;
-                    renderNotices(allNotices);
+                    updateStats();
+                    updateCourtFilters();
+                    applyFilters();
                 }
-            } catch (error) { console.error('Error:', error); }
+            } catch (error) { showError(); }
         }
 
-        function updateStats(data) {
-            document.getElementById('totalCount').textContent = data.count;
-            document.getElementById('courtCount').textContent = Object.keys(data.court_stats).length;
-            const realEstate = data.notices.filter(n => n.title.includes('부동산') || n.title.includes('매각')).length;
-            document.getElementById('realEstateCount').textContent = realEstate;
-            document.getElementById('attachmentCount').textContent = '-';
+        function showLoading(msg = '공고 목록을 불러오는 중...') {
+            document.getElementById('noticesContainer').innerHTML = `<div class="text-center py-12"><div class="loading"></div><p class="text-gray-500 mt-3 text-sm">${msg}</p></div>`;
         }
 
-        function updateCourtFilters(courtStats) {
-            const container = document.getElementById('courtFilters');
-            let html = `<button onclick="filterByCourt('all')" class="court-filter ${currentFilter === 'all' ? 'bg-blue-600 text-white' : 'bg-gray-200 text-gray-700'} px-4 py-2 rounded-full text-sm font-medium transition hover:bg-blue-500 hover:text-white" data-court="all">전체</button>`;
-            for (const [court, count] of Object.entries(courtStats)) {
-                const isActive = currentFilter === court;
-                html += `<button onclick="filterByCourt('${court}')" class="court-filter ${isActive ? 'bg-blue-600 text-white' : 'bg-gray-200 text-gray-700'} px-4 py-2 rounded-full text-sm font-medium transition hover:bg-blue-500 hover:text-white" data-court="${court}">${court} <span class="ml-1 opacity-75">(${count})</span></button>`;
-            }
-            container.innerHTML = html;
+        function showError() {
+            document.getElementById('noticesContainer').innerHTML = '<div class="text-center py-12"><i class="fas fa-exclamation-circle text-red-400 text-3xl mb-3"></i><p class="text-gray-500 text-sm">데이터를 불러오는데 실패했습니다.</p><button onclick="loadNotices()" class="mt-3 text-blue-600 text-sm hover:underline">다시 시도</button></div>';
+        }
+
+        function updateStats() {
+            const stats = { '부동산': 0, '동산': 0, '채권': 0, '기타': 0 };
+            allNotices.forEach(n => { stats[n.category] = (stats[n.category] || 0) + 1; });
+            
+            document.getElementById('totalCount').textContent = allNotices.length;
+            document.getElementById('realEstateCount').textContent = stats['부동산'];
+            document.getElementById('movableCount').textContent = stats['동산'];
+            document.getElementById('bondCount').textContent = stats['채권'];
+            
+            // Update tab counts
+            document.querySelectorAll('.category-tab').forEach(tab => {
+                const cat = tab.dataset.category;
+                const countEl = tab.querySelector('.count');
+                if (countEl) {
+                    countEl.textContent = cat === 'all' ? allNotices.length : (stats[cat] || 0);
+                }
+            });
+        }
+
+        function updateCourtFilters() {
+            const courts = {};
+            allNotices.forEach(n => { courts[n.court] = (courts[n.court] || 0) + 1; });
+            
+            let html = `<button onclick="filterByCourt('all')" class="court-btn ${currentCourt === 'all' ? 'bg-blue-600 text-white' : 'bg-gray-100 text-gray-600'} px-3 py-1.5 rounded-full text-xs font-medium transition hover:bg-blue-500 hover:text-white" data-court="all">전체</button>`;
+            
+            Object.entries(courts).sort((a,b) => b[1] - a[1]).forEach(([court, count]) => {
+                const isActive = currentCourt === court;
+                html += `<button onclick="filterByCourt('${court}')" class="court-btn ${isActive ? 'bg-blue-600 text-white' : 'bg-gray-100 text-gray-600'} px-3 py-1.5 rounded-full text-xs font-medium transition hover:bg-blue-500 hover:text-white" data-court="${court}">${court} (${count})</button>`;
+            });
+            
+            document.getElementById('courtFilters').innerHTML = html;
+        }
+
+        function filterByCategory(category) {
+            currentCategory = category;
+            document.querySelectorAll('.category-tab').forEach(tab => {
+                tab.classList.toggle('active', tab.dataset.category === category);
+            });
+            applyFilters();
         }
 
         function filterByCourt(court) {
-            currentFilter = court;
-            document.querySelectorAll('.court-filter').forEach(btn => {
-                btn.className = btn.dataset.court === court ? 'court-filter bg-blue-600 text-white px-4 py-2 rounded-full text-sm font-medium transition' : 'court-filter bg-gray-200 text-gray-700 px-4 py-2 rounded-full text-sm font-medium transition hover:bg-blue-500 hover:text-white';
+            currentCourt = court;
+            document.querySelectorAll('.court-btn').forEach(btn => {
+                const isActive = btn.dataset.court === court;
+                btn.className = `court-btn ${isActive ? 'bg-blue-600 text-white' : 'bg-gray-100 text-gray-600'} px-3 py-1.5 rounded-full text-xs font-medium transition hover:bg-blue-500 hover:text-white`;
             });
-            renderNotices(court === 'all' ? allNotices : allNotices.filter(n => n.court === court));
+            applyFilters();
+        }
+
+        function applyFilters() {
+            let filtered = allNotices;
+            if (currentCategory !== 'all') filtered = filtered.filter(n => n.category === currentCategory);
+            if (currentCourt !== 'all') filtered = filtered.filter(n => n.court === currentCourt);
+            renderNotices(filtered);
         }
 
         function renderNotices(notices) {
             const container = document.getElementById('noticesContainer');
             if (notices.length === 0) {
-                container.innerHTML = '<div class="text-center py-12"><i class="fas fa-search text-gray-300 text-5xl mb-4"></i><p class="text-gray-500">검색 결과가 없습니다.</p></div>';
+                container.innerHTML = '<div class="text-center py-12"><i class="fas fa-inbox text-gray-300 text-4xl mb-3"></i><p class="text-gray-500 text-sm">해당하는 공고가 없습니다.</p></div>';
+                document.getElementById('loadMoreContainer').style.display = 'none';
                 return;
             }
-            let html = '';
-            notices.forEach((notice, index) => {
-                const courtColor = getCourtColor(notice.court);
-                html += `<div class="bg-white rounded-xl shadow-md p-5 card-hover fade-in cursor-pointer" onclick="showDetail('${notice.detail_id}')" style="animation-delay: ${index * 0.05}s">
-                    <div class="flex flex-col md:flex-row md:items-center justify-between gap-4">
-                        <div class="flex-1">
-                            <div class="flex items-center gap-2 mb-2"><span class="badge ${courtColor}">${notice.court}</span><span class="text-gray-400 text-sm">#${notice.num}</span></div>
-                            <h3 class="text-lg font-semibold text-gray-800 mb-2 hover:text-blue-600 transition">${notice.title}</h3>
-                            <p class="text-gray-500 text-sm"><i class="fas fa-user mr-1"></i>${notice.debtor}</p>
+            
+            container.innerHTML = notices.map((n, i) => `
+                <div class="bg-white rounded-xl shadow-sm p-4 card-hover fade-in cursor-pointer border border-gray-100" onclick="showDetail('${n.detail_id}')" style="animation-delay:${i*0.03}s">
+                    <div class="flex items-start gap-3">
+                        <div class="flex-1 min-w-0">
+                            <div class="flex flex-wrap items-center gap-1.5 mb-2">
+                                <span class="badge category-badge-${n.category}">${n.category}</span>
+                                <span class="badge bg-gray-100 text-gray-600">${n.court}</span>
+                                <span class="text-gray-400 text-xs">#${n.num}</span>
+                            </div>
+                            <h3 class="font-semibold text-gray-800 text-sm md:text-base mb-1.5 line-clamp-2">${n.title}</h3>
+                            <p class="text-gray-500 text-xs truncate"><i class="fas fa-user mr-1"></i>${n.debtor}</p>
                         </div>
-                        <div class="flex items-center gap-4 text-sm text-gray-400"><span><i class="fas fa-eye mr-1"></i>${notice.views}</span><i class="fas fa-chevron-right text-blue-400"></i></div>
+                        <div class="flex flex-col items-end gap-1 flex-shrink-0">
+                            <span class="text-gray-400 text-xs"><i class="fas fa-eye mr-1"></i>${n.views}</span>
+                            <i class="fas fa-chevron-right text-blue-400 text-sm"></i>
+                        </div>
                     </div>
-                </div>`;
-            });
-            container.innerHTML = html;
+                </div>
+            `).join('');
+            
             document.getElementById('loadMoreContainer').style.display = 'block';
-        }
-
-        function getCourtColor(court) {
-            const colors = {'서울회생법원': 'bg-blue-100 text-blue-700', '수원회생법원': 'bg-green-100 text-green-700', '인천지방법원': 'bg-purple-100 text-purple-700', '광주지방법원': 'bg-orange-100 text-orange-700', '대전지방법원': 'bg-red-100 text-red-700', '부산지방법원': 'bg-yellow-100 text-yellow-700'};
-            return colors[court] || 'bg-gray-100 text-gray-700';
         }
 
         async function showDetail(detailId) {
             const modal = document.getElementById('detailModal');
-            const modalContent = document.getElementById('modalContent');
+            const content = document.getElementById('modalContent');
             modal.classList.add('active');
-            modalContent.innerHTML = '<div class="text-center py-8"><div class="loading"></div><p class="text-gray-500 mt-4">상세 정보를 불러오는 중...</p></div>';
+            content.innerHTML = '<div class="text-center py-12"><div class="loading"></div><p class="text-gray-500 mt-3 text-sm">상세 정보를 불러오는 중...</p></div>';
+            
             try {
                 const response = await fetch(`${API_BASE}/api/notices/${detailId}`);
                 const data = await response.json();
+                
                 if (data.success) {
-                    const notice = data.notice;
-                    document.getElementById('modalTitle').textContent = notice.title || '공고 상세';
-                    let attachmentsHtml = '';
-                    if (notice.attachments && notice.attachments.length > 0) {
-                        attachmentsHtml = `<div class="mt-6"><h4 class="font-semibold text-gray-700 mb-3"><i class="fas fa-paperclip mr-2"></i>첨부파일 (${notice.attachments.length}개)</h4><div class="space-y-2">${notice.attachments.map(att => `<div class="attachment-card bg-gray-50 p-3 rounded-lg flex items-center justify-between"><div class="flex items-center gap-3"><i class="fas fa-file-pdf text-red-500 text-xl"></i><div><p class="font-medium text-gray-800">${att.filename}</p><p class="text-xs text-gray-500">PDF 문서</p></div></div><span class="text-blue-600 text-sm"><i class="fas fa-external-link-alt"></i></span></div>`).join('')}</div></div>`;
+                    const n = data.notice;
+                    const bi = n.bid_info || {};
+                    document.getElementById('modalTitle').textContent = n.title || '공고 상세';
+                    
+                    // 입찰정보 섹션
+                    let bidInfoHtml = '';
+                    if (bi.minimum_price_formatted || bi.bid_date || bi.deposit_formatted || bi.deposit_rate) {
+                        bidInfoHtml = `
+                            <div class="price-highlight mb-4">
+                                <h4 class="font-bold text-amber-800 mb-3 flex items-center gap-2">
+                                    <i class="fas fa-gavel"></i>입찰 핵심 정보
+                                </h4>
+                                <div class="info-grid">
+                                    ${bi.minimum_price_formatted ? `<div class="info-item bg-white"><p class="info-label">최저입찰가</p><p class="info-value text-red-600">${bi.minimum_price_formatted}</p></div>` : ''}
+                                    ${bi.bid_date ? `<div class="info-item bg-white"><p class="info-label">입찰기일</p><p class="info-value">${bi.bid_date}</p></div>` : ''}
+                                    ${bi.deposit_formatted ? `<div class="info-item bg-white"><p class="info-label">보증금</p><p class="info-value">${bi.deposit_formatted}</p></div>` : ''}
+                                    ${bi.deposit_rate ? `<div class="info-item bg-white"><p class="info-label">보증금율</p><p class="info-value">${bi.deposit_rate}</p></div>` : ''}
+                                    ${bi.bid_location ? `<div class="info-item bg-white col-span-2"><p class="info-label">입찰장소</p><p class="info-value text-sm">${bi.bid_location}</p></div>` : ''}
+                                    ${bi.property_location ? `<div class="info-item bg-white col-span-2 md:col-span-3"><p class="info-label">소재지</p><p class="info-value text-sm">${bi.property_location}</p></div>` : ''}
+                                    ${bi.area ? `<div class="info-item bg-white"><p class="info-label">면적</p><p class="info-value">${bi.area}㎡</p></div>` : ''}
+                                    ${bi.payment_deadline ? `<div class="info-item bg-white"><p class="info-label">잔금기한</p><p class="info-value">${bi.payment_deadline}</p></div>` : ''}
+                                </div>
+                            </div>
+                        `;
                     }
-                    modalContent.innerHTML = `<div class="space-y-4"><div class="bg-blue-50 p-4 rounded-lg"><p class="text-sm text-blue-800"><i class="fas fa-info-circle mr-2"></i>공고 ID: ${notice.id} | 수집일시: ${new Date(notice.scraped_at).toLocaleString('ko-KR')}</p></div>${notice.content ? `<div><h4 class="font-semibold text-gray-700 mb-2"><i class="fas fa-align-left mr-2"></i>공고 내용</h4><div class="bg-gray-50 p-4 rounded-lg text-gray-600 text-sm leading-relaxed">${notice.content || '내용 없음'}</div></div>` : ''}${attachmentsHtml}<div class="pt-4 border-t flex justify-end gap-3"><a href="https://www.scourt.go.kr/portal/notice/realestate/RealNoticeView.work?seq_id=${notice.id}" target="_blank" class="bg-blue-600 hover:bg-blue-700 text-white px-4 py-2 rounded-lg transition"><i class="fas fa-external-link-alt mr-2"></i>원문 보기</a><button onclick="closeModal()" class="bg-gray-200 hover:bg-gray-300 text-gray-700 px-4 py-2 rounded-lg transition">닫기</button></div></div>`;
+                    
+                    // 첨부파일 섹션
+                    let attachHtml = '';
+                    if (n.attachments && n.attachments.length > 0) {
+                        attachHtml = `
+                            <div class="mt-4">
+                                <h4 class="font-semibold text-gray-700 mb-2 flex items-center gap-2"><i class="fas fa-paperclip"></i>첨부파일 (${n.attachments.length})</h4>
+                                <div class="space-y-2">
+                                    ${n.attachments.map(att => `
+                                        <div class="flex items-center gap-3 bg-gray-50 p-3 rounded-lg border-l-4 border-blue-400">
+                                            <i class="fas fa-file-pdf text-red-500"></i>
+                                            <span class="flex-1 text-sm text-gray-700 truncate">${att.filename}</span>
+                                        </div>
+                                    `).join('')}
+                                </div>
+                            </div>
+                        `;
+                    }
+                    
+                    content.innerHTML = `
+                        <div class="space-y-4">
+                            <div class="flex items-center gap-2">
+                                <span class="badge category-badge-${n.category}">${n.category}</span>
+                                <span class="text-gray-400 text-xs">ID: ${n.id}</span>
+                            </div>
+                            
+                            ${bidInfoHtml}
+                            
+                            ${n.content ? `
+                                <div>
+                                    <h4 class="font-semibold text-gray-700 mb-2 flex items-center gap-2"><i class="fas fa-file-alt"></i>공고 내용</h4>
+                                    <div class="bg-gray-50 p-4 rounded-lg text-sm text-gray-600 leading-relaxed max-h-60 overflow-y-auto whitespace-pre-wrap">${n.content}</div>
+                                </div>
+                            ` : ''}
+                            
+                            ${attachHtml}
+                            
+                            <div class="flex gap-2 pt-4 border-t">
+                                <a href="https://www.scourt.go.kr/portal/notice/realestate/RealNoticeView.work?seq_id=${n.id}" target="_blank" class="flex-1 bg-blue-600 hover:bg-blue-700 text-white text-center py-2.5 rounded-lg text-sm font-medium transition">
+                                    <i class="fas fa-external-link-alt mr-2"></i>원문 보기
+                                </a>
+                                <button onclick="closeModal()" class="px-4 bg-gray-100 hover:bg-gray-200 text-gray-700 rounded-lg text-sm font-medium transition">닫기</button>
+                            </div>
+                        </div>
+                    `;
                 }
             } catch (error) {
-                console.error('Error:', error);
-                modalContent.innerHTML = '<div class="text-center py-8"><i class="fas fa-exclamation-circle text-red-500 text-4xl mb-4"></i><p class="text-gray-500">상세 정보를 불러오는데 실패했습니다.</p></div>';
+                content.innerHTML = '<div class="text-center py-8"><i class="fas fa-exclamation-circle text-red-400 text-3xl mb-3"></i><p class="text-gray-500 text-sm">정보를 불러오는데 실패했습니다.</p></div>';
             }
         }
 
@@ -443,22 +756,23 @@ LANDING_HTML = """
         async function loadMore() {
             currentPage++;
             try {
-                const response = await fetch(`${API_BASE}/api/notices?page=${currentPage}&limit=20`);
+                const response = await fetch(`${API_BASE}/api/notices?page=${currentPage}&limit=30`);
                 const data = await response.json();
                 if (data.success && data.notices.length > 0) {
                     allNotices = [...allNotices, ...data.notices];
-                    renderNotices(allNotices);
+                    updateStats();
+                    updateCourtFilters();
+                    applyFilters();
                 }
-            } catch (error) { console.error('Error:', error); }
+            } catch (error) { console.error(error); }
         }
 
-        document.getElementById('searchInput').addEventListener('keypress', function(e) { if (e.key === 'Enter') searchNotices(); });
-        document.getElementById('detailModal').addEventListener('click', function(e) { if (e.target === this) closeModal(); });
+        document.getElementById('searchInput').addEventListener('keypress', e => { if (e.key === 'Enter') searchNotices(); });
+        document.getElementById('detailModal').addEventListener('click', e => { if (e.target.id === 'detailModal') closeModal(); });
         loadNotices();
     </script>
 </body>
-</html>
-"""
+</html>'''
 
 
 @app.get("/", response_class=HTMLResponse)
@@ -472,8 +786,9 @@ async def api_info():
     """API 정보"""
     return {
         "service": "대법원 파산재산공고 API",
-        "version": "1.0.0",
+        "version": "2.0.0",
         "description": "대법원 파산재산공고 데이터를 실시간으로 수집하는 API",
+        "features": ["카테고리 분류 (부동산/동산/채권/기타)", "입찰정보 자동 추출", "첨부파일 분석"],
         "endpoints": {
             "공고 목록": "/api/notices",
             "공고 상세": "/api/notices/{detail_id}",
@@ -488,15 +803,25 @@ async def api_info():
 @app.get("/api/notices")
 async def get_notices(
     page: int = Query(1, ge=1, description="페이지 번호"),
-    limit: int = Query(10, ge=1, le=50, description="페이지당 항목 수")
+    limit: int = Query(10, ge=1, le=50, description="페이지당 항목 수"),
+    category: Optional[str] = Query(None, description="카테고리 필터 (부동산/동산/채권/기타)")
 ):
     """파산재산공고 목록 조회"""
     notices = scraper.get_notice_list(page=page, limit=limit)
     
+    # 카테고리 필터링
+    if category:
+        notices = [n for n in notices if n.get('category') == category]
+    
+    # 통계
     court_stats = {}
+    category_stats = {'부동산': 0, '동산': 0, '채권': 0, '기타': 0}
+    
     for notice in notices:
         court = notice.get('court', '기타')
         court_stats[court] = court_stats.get(court, 0) + 1
+        cat = notice.get('category', '기타')
+        category_stats[cat] = category_stats.get(cat, 0) + 1
     
     return {
         "success": True,
@@ -504,6 +829,7 @@ async def get_notices(
         "limit": limit,
         "count": len(notices),
         "court_stats": court_stats,
+        "category_stats": category_stats,
         "notices": notices,
         "scraped_at": datetime.now().isoformat()
     }
@@ -511,7 +837,7 @@ async def get_notices(
 
 @app.get("/api/notices/{detail_id}")
 async def get_notice_detail(detail_id: str):
-    """파산재산공고 상세 정보 조회"""
+    """파산재산공고 상세 정보 조회 (입찰정보 포함)"""
     detail = scraper.get_notice_detail(detail_id)
     
     if not detail:
@@ -534,15 +860,20 @@ async def get_stats(pages: int = Query(3, ge=1, le=10, description="수집할 �
             all_notices.extend(notices)
     
     court_stats = {}
+    category_stats = {'부동산': 0, '동산': 0, '채권': 0, '기타': 0}
+    
     for notice in all_notices:
         court = notice.get('court', '기타')
         court_stats[court] = court_stats.get(court, 0) + 1
+        cat = notice.get('category', '기타')
+        category_stats[cat] = category_stats.get(cat, 0) + 1
     
     return {
         "success": True,
         "total_count": len(all_notices),
         "pages_scraped": pages,
         "court_stats": court_stats,
+        "category_stats": category_stats,
         "scraped_at": datetime.now().isoformat()
     }
 
@@ -550,7 +881,8 @@ async def get_stats(pages: int = Query(3, ge=1, le=10, description="수집할 �
 @app.get("/api/search")
 async def search_notices(
     keyword: str = Query(..., min_length=1, description="검색어"),
-    pages: int = Query(3, ge=1, le=10, description="검색할 페이지 수")
+    pages: int = Query(3, ge=1, le=10, description="검색할 페이지 수"),
+    category: Optional[str] = Query(None, description="카테고리 필터")
 ):
     """공고 검색"""
     all_notices = []
@@ -568,9 +900,14 @@ async def search_notices(
         or keyword_lower in n.get('debtor', '').lower()
     ]
     
+    # 카테고리 필터
+    if category:
+        filtered = [n for n in filtered if n.get('category') == category]
+    
     return {
         "success": True,
         "keyword": keyword,
+        "category": category,
         "total_searched": len(all_notices),
         "match_count": len(filtered),
         "notices": filtered,
@@ -581,4 +918,4 @@ async def search_notices(
 @app.get("/health")
 async def health_check():
     """헬스체크"""
-    return {"status": "healthy", "timestamp": datetime.now().isoformat()}
+    return {"status": "healthy", "version": "2.0.0", "timestamp": datetime.now().isoformat()}
